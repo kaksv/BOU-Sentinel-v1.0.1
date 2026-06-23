@@ -25,22 +25,37 @@ git push -u origin main
 
 ## Step 2: Deploy Backend to Render
 
-### Option A: One-click with render.yaml (RECOMMENDED — EASIEST)
+### Option A: One-click Blueprint (Auto-creates Web Service + PostgreSQL)
 
-⚠️ **Important:** The `render.yaml` must be at the **root** of your GitHub repo. It includes `rootDir: backend` so Render knows where your Python code lives.
+The `render.yaml` at the repo root auto-creates:
+- **Web Service** — FastAPI backend (builds from `backend/` directory)
+- **PostgreSQL** — Free tier database
 
-1. Go to **[render.com](https://render.com)** and sign in with GitHub
+1. Go to **[render.com](https://render.com)** → sign in with GitHub
 2. Click **"New +"** → **"Blueprint"**
 3. Connect your GitHub repo
-4. Render will find `render.yaml` at the repo root and auto-create:
-   - **Web Service** (`bou-sentinel-api`) — FastAPI backend
-   - **PostgreSQL** (`bou-sentinel-db`) — Free tier
-   - **Redis** (`bou-sentinel-redis`) — Free tier
-5. Click **"Apply"**
+4. Click **"Apply"** — Render auto-creates the web service + database
+5. ✅ Web service + PostgreSQL are done
 
-> ⏱️ First deploy takes ~3 minutes. Render auto-links the DB + Redis to the web service.
+### Step 2b: Add Redis (Blueprint doesn't support Redis — do manually)
 
-### Option B: Manual Setup (if Blueprint doesn't work)
+After Blueprint finishes:
+
+1. In Render Dashboard, click **"New +"** → **"Redis"**
+2. **Name:** `bou-sentinel-redis`
+3. **Plan:** **Free**
+4. Click **"Create Redis"**
+
+### Step 2c: Link Redis to Web Service
+
+1. Go to your **Web Service** (`bou-sentinel-api`) dashboard
+2. Click **"Environment"** tab
+3. Add env var:
+   - **Key:** `REDIS_URL`
+   - **Value:** Paste the **Internal Connection String** from the Redis dashboard
+4. Click **"Save Changes"** → Render will redeploy
+
+### Option B: Full Manual Setup (if Blueprint doesn't work)
 
 #### 2a. Create PostgreSQL Database
 - Dashboard → **New +** → **PostgreSQL**

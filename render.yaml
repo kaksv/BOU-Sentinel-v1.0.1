@@ -2,27 +2,9 @@ services:
   - type: web
     name: bou-sentinel-api
     env: python
-    rootDir: backend
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 2
-    envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: bou-sentinel-db
-          property: connectionString
-      - key: REDIS_URL
-        fromService:
-          type: redis
-          name: bou-sentinel-redis
-          property: connectionString
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
 
 databases:
-  - type: postgresql
-    name: bou-sentinel-db
+  - name: bou-sentinel-db
     plan: free
-    ipAllowList: [] # only allow internal connections
-
-redis:
-  - name: bou-sentinel-redis
-    plan: free
-    maxmemoryPolicy: noeviction
