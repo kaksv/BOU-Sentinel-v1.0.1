@@ -17,8 +17,11 @@ import RiskScoreGauge from './RiskScoreGauge';
 import FraudHeatmap from './FraudHeatmap';
 import FraudAlertBanner from './FraudAlertBanner';
 
-const WS_URL = `ws://${window.location.hostname}:8000/ws`;
-const API_URL = 'http://localhost:8000';
+// In development, Vite proxy handles /api and /ws
+// In production, set VITE_API_URL to your Render backend (e.g., https://bou-sentinel.onrender.com)
+const BACKEND_URL = import.meta.env.VITE_API_URL || `http://${window.location.hostname}:8000`;
+const WS_URL = import.meta.env.VITE_WS_URL || `ws://${window.location.hostname}:8000/ws`;
+const API_URL = BACKEND_URL;
 
 // ================================================================
 // Animated Number Counter
