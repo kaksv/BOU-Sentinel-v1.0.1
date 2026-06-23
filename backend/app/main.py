@@ -5,7 +5,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import List, Optional
 
-import redis.asyncio as aioredis
+try:
+    import redis.asyncio as aioredis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+
 from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, case
@@ -21,11 +26,8 @@ from app.fraud_model import get_model
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bou-sentinel")
 
-# Global Redis connection
-redis_client: Optional[aioredis.Redis] = None
-
-# Background tasks
-_redis_listener_task: Optional[asyncio.Task] = None
+# Redis is optional — WebSocket broadcasts work directly without it
+redis_client = None
 
 
 # ============================================================
@@ -34,7 +36,7 @@ _redis_listener_task: Optional[asyncio.Task] = None
 class ConnectionManager:
     """
     Manages WebSocket connections and broadcasts messages to all clients.
-    Implements the pub/sub bridge between Redis and connected frontends.
+    This is the core real-time streaming mechanism — works without Redis.
     """
 
     def __init__(self):
@@ -66,7 +68,6 @@ class ConnectionManager:
                     logger.warning(f"⚠️ WebSocket send error: {e}")
                     disconnected.append(connection)
 
-            # Clean up disconnected clients
             for conn in disconnected:
                 if conn in self.active_connections:
                     self.active_connections.remove(conn)
@@ -80,52 +81,12 @@ manager = ConnectionManager()
 
 
 # ============================================================
-# Redis Pub/Sub Listener (Background Task)
-# ============================================================
-async def redis_pubsub_listener():
-    """
-    Background task that subscribes to the Redis fraud_stream channel
-    and broadcasts received messages to all connected WebSocket clients.
-    """
-    global redis_client
-
-    logger.info("📡 Starting Redis Pub/Sub listener...")
-
-    while True:
-        try:
-            if redis_client is None:
-                logger.warning("⏳ Redis not connected. Retrying in 5 seconds...")
-                await asyncio.sleep(5)
-                continue
-
-            pubsub = redis_client.pubsub()
-            await pubsub.subscribe(settings.REDIS_CHANNEL)
-            logger.info(f"✅ Subscribed to Redis channel: {settings.REDIS_CHANNEL}")
-
-            async for message in pubsub.listen():
-                if message["type"] == "message":
-                    data = message["data"]
-                    if isinstance(data, bytes):
-                        data = data.decode("utf-8")
-
-                    logger.debug(f"📤 Broadcasting to {manager.count} WebSocket client(s)")
-                    await manager.broadcast(data)
-
-        except asyncio.CancelledError:
-            logger.info("🛑 Redis Pub/Sub listener cancelled.")
-            break
-        except Exception as e:
-            logger.error(f"❌ Redis Pub/Sub error: {e}")
-            await asyncio.sleep(5)
-
-
-# ============================================================
 # Application Lifespan
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown events."""
-    global redis_client, _redis_listener_task
+    global redis_client
 
     # Startup
     logger.info("🚀 BOU Sentinel starting up...")
@@ -137,36 +98,25 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ Database initialization skipped: {e}")
 
-    # Connect to Redis
-    try:
-        redis_client = aioredis.from_url(
-            settings.REDIS_URL,
-            decode_responses=True
-        )
-        await redis_client.ping()
-        logger.info("✅ Redis connection established")
-
-        # Start the Redis Pub/Sub listener as a background task
-        _redis_listener_task = asyncio.create_task(redis_pubsub_listener())
-        logger.info("✅ Redis Pub/Sub listener started")
-    except Exception as e:
-        logger.warning(f"⚠️ Redis connection failed: {e}")
-        redis_client = None
+    # Connect to Redis (optional — only if URL and package are available)
+    if REDIS_AVAILABLE:
+        try:
+            redis_client = aioredis.from_url(
+                settings.REDIS_URL,
+                decode_responses=True
+            )
+            await redis_client.ping()
+            logger.info("✅ Redis connection established")
+        except Exception as e:
+            logger.info(f"ℹ️ Redis not available — WebSocket broadcasts work without it. ({e})")
+            redis_client = None
+    else:
+        logger.info("ℹ️ Redis not installed — WebSocket broadcasts work without it.")
 
     yield
 
     # Shutdown
     logger.info("🛑 BOU Sentinel shutting down...")
-
-    # Cancel background tasks
-    if _redis_listener_task:
-        _redis_listener_task.cancel()
-        try:
-            await _redis_listener_task
-        except asyncio.CancelledError:
-            pass
-
-    # Close Redis connection
     if redis_client:
         await redis_client.close()
 
@@ -200,12 +150,10 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Keep the connection alive and handle client messages
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text("pong")
             elif data == "stats":
-                # Client can request current connection stats
                 await websocket.send_text(json.dumps({
                     "type": "ws_stats",
                     "connected_clients": manager.count,
@@ -243,7 +191,7 @@ async def health_check():
     except Exception:
         db_status = "disconnected"
 
-    redis_status = "disconnected"
+    redis_status = "not_configured"
     if redis_client:
         try:
             await redis_client.ping()
@@ -285,18 +233,14 @@ async def create_transaction(
 ):
     """
     Receive a transaction, score it with the AI fraud model,
-    save it to PostgreSQL, and publish to Redis Pub/Sub channel.
+    save it to PostgreSQL, and broadcast to WebSocket clients.
     """
-    # Get fraud detection model
     model = get_model()
-
-    # Convert to dict for model scoring
     tx_dict = transaction_data.model_dump()
 
-    # Score the transaction
+    # Score with AI model
     risk_score, is_fraud, fraud_reason = model.score(tx_dict)
 
-    # Log the result
     logger.info(
         f"📊 Transaction {transaction_data.transaction_id}: "
         f"risk={risk_score:.2f}, fraud={is_fraud}, reason={fraud_reason}"
@@ -353,16 +297,17 @@ async def create_transaction(
         processed_at=db_transaction.processed_at.isoformat() if db_transaction.processed_at else None,
     )
 
-    # Publish to Redis channel - the Pub/Sub listener will broadcast via WebSocket
+    response_json = response.model_dump_json()
+
+    # Broadcast to all WebSocket clients directly (no Redis needed!)
+    await manager.broadcast(response_json)
+
+    # Also publish to Redis if available (for scaling to multiple instances)
     if redis_client:
         try:
-            await redis_client.publish(
-                settings.REDIS_CHANNEL,
-                response.model_dump_json(),
-            )
-            logger.debug(f"📤 Published transaction to Redis channel: {settings.REDIS_CHANNEL}")
+            await redis_client.publish(settings.REDIS_CHANNEL, response_json)
         except Exception as e:
-            logger.error(f"Failed to publish to Redis: {e}")
+            logger.debug(f"Redis publish skipped: {e}")
 
     return response
 
@@ -411,7 +356,6 @@ async def get_stats(db: Session = Depends(get_db)):
         db.query(Transaction.risk_score).subquery().c.risk_score
     ).all()
 
-    # Get recent transaction counts by minute for the chart
     recent_txs = (
         db.query(
             func.date_trunc('minute', Transaction.processed_at).label('minute'),
