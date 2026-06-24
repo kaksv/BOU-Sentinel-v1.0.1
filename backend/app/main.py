@@ -29,17 +29,8 @@ from app.database import init_db, get_db
 # ── Fraud detection ──────────────────────────────────────────────────────────
 from app.models.models import Transaction
 from app.schemas import HealthCheck, TransactionCreate, TransactionResponse
-from app.models.fraud_model import get_model
-
-# ── Regulatory compliance ────────────────────────────────────────────────────
-from app.regulatory_models import Institution   # noqa: F401 (needed for create_all)
-from app.regulatory_models import ComplianceReport  # noqa: F401
-from app.compliance_engine import calculate_compliance_risk
-from app.seed_institutions import seed_institutions, get_institution_from_account
-from app.regulatory_router import router as regulatory_router
-
-# ── WebSocket ────────────────────────────────────────────────────────────────
-from app.ws_manager import manager  # singleton ConnectionManager
+from app.fraud_model import get_model
+from app.institution_router import router as institution_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bou-sentinel")
@@ -100,13 +91,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register the regulatory compliance router
-app.include_router(regulatory_router)
+# Include institutional monitoring routes
+app.include_router(institution_router)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WEBSOCKET  (single channel — both transaction events AND compliance alerts)
-# ─────────────────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

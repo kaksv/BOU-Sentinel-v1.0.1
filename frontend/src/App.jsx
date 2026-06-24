@@ -16,6 +16,9 @@ import LiveTransactionFeed from './LiveTransactionFeed';
 import RiskScoreGauge from './RiskScoreGauge';
 import FraudHeatmap from './FraudHeatmap';
 import FraudAlertBanner from './FraudAlertBanner';
+import SectorSummary from './SectorSummary';
+import InstitutionList from './InstitutionList';
+import InstitutionDashboard from './InstitutionDashboard';
 
 // In development, Vite proxy handles /api and /ws
 // In production, set VITE_API_URL to your Render backend (e.g., https://bou-sentinel.onrender.com)
@@ -120,8 +123,20 @@ export default function App() {
     ws_clients: 0,
   });
 
+  const [selectedInstitutionCode, setSelectedInstitutionCode] = useState(null);
+  const [activeTab, setActiveTab] = useState('fraud'); // 'fraud' | 'sector'
+
   const wsRef = useRef(null);
   const fraudTimerRef = useRef(null);
+
+  // Expose institution selector globally for table row clicks
+  useEffect(() => {
+    window.__institutionCode = (code) => {
+      setSelectedInstitutionCode(code);
+      setActiveTab('sector');
+    };
+    return () => { window.__institutionCode = null; };
+  }, []);
 
   // ================================================================
   // WebSocket Connection
@@ -286,87 +301,133 @@ export default function App() {
 
       {/* Main Content */}
       <main className="max-w-7xl mx-auto px-6 py-6 relative">
+        {/* Tab Switcher */}
+        <div className="flex items-center gap-2 mb-6">
+          <button
+            onClick={() => setActiveTab('fraud')}
+            className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors ${
+              activeTab === 'fraud'
+                ? 'bg-bou-600 text-white'
+                : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            🔍 Fraud Monitor
+          </button>
+          <button
+            onClick={() => setActiveTab('sector')}
+            className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors ${
+              activeTab === 'sector'
+                ? 'bg-bou-600 text-white'
+                : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            🏛️ Sector Overview
+          </button>
+        </div>
+
         {/* Stats Row */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-          <StatCard
-            title="Total Transactions"
-            value={<AnimatedNumber value={totalTxns} />}
-            subtitle="All time monitored"
-            trend={5}
-            color="slate"
-            icon={
-              <svg className="w-5 h-5 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3 4v16h18V4H3zm2 14V6h14v12H5zm4-6h6" />
-              </svg>
-            }
-          />
-
-          <StatCard
-            title="Fraud Detected"
-            value={<AnimatedNumber value={fraudTxns} />}
-            subtitle={`${fraudRate.toFixed(2)}% of all transactions`}
-            trend={fraudRate > 10 ? -8 : 12}
-            color="red"
-            isFraud={fraudRate > 5}
-            icon={
-              <svg className="w-5 h-5 text-fraud-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
-              </svg>
-            }
-          />
-
-          <StatCard
-            title="Fraud Rate"
-            value={<AnimatedNumber value={fraudRate} decimals={2} suffix="%" />}
-            subtitle="Percentage flagged"
-            color="amber"
-            icon={
-              <svg className="w-5 h-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3 4.5h18M3 9h18m-6 4.5h6M3 13.5h3m3 0h3" />
-              </svg>
-            }
-          />
-
-          <StatCard
-            title="Avg Risk Score"
-            value={<AnimatedNumber value={avgRisk * 100} decimals={1} suffix="%" />}
-            subtitle="Model confidence"
-            color="gold"
-            icon={
-              <svg className="w-5 h-5 text-gold-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-              </svg>
-            }
-          />
-        </div>
-
-        {/* Middle Row: Transaction Volume Chart */}
-        <div className="mb-6">
-          <TransactionVolumeChart activityData={activityData} />
-        </div>
-
-        {/* System Status Bar */}
-        <div className="mb-6">
-          <SystemStatusBar info={systemInfo} wsConnected={wsConnected} />
-        </div>
-
-        {/* Bottom Row: 3-column layout */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-1 h-[500px]">
-            <LiveTransactionFeed transactions={transactions} />
+        {activeTab === 'fraud' && (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+            <StatCard
+              title="Total Transactions"
+              value={<AnimatedNumber value={totalTxns} />}
+              subtitle="All time monitored"
+              trend={5}
+              color="slate"
+              icon={
+                <svg className="w-5 h-5 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 4v16h18V4H3zm2 14V6h14v12H5zm4-6h6" />
+                </svg>
+              }
+            />
+            <StatCard
+              title="Fraud Detected"
+              value={<AnimatedNumber value={fraudTxns} />}
+              subtitle={`${fraudRate.toFixed(2)}% of all transactions`}
+              trend={fraudRate > 10 ? -8 : 12}
+              color="red"
+              isFraud={fraudRate > 5}
+              icon={
+                <svg className="w-5 h-5 text-fraud-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                </svg>
+              }
+            />
+            <StatCard
+              title="Fraud Rate"
+              value={<AnimatedNumber value={fraudRate} decimals={2} suffix="%" />}
+              subtitle="Percentage flagged"
+              color="amber"
+              icon={
+                <svg className="w-5 h-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 4.5h18M3 9h18m-6 4.5h6M3 13.5h3m3 0h3" />
+                </svg>
+              }
+            />
+            <StatCard
+              title="Avg Risk Score"
+              value={<AnimatedNumber value={avgRisk * 100} decimals={1} suffix="%" />}
+              subtitle="Model confidence"
+              color="gold"
+              icon={
+                <svg className="w-5 h-5 text-gold-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                </svg>
+              }
+            />
           </div>
-          <div className="lg:col-span-1">
-            <RiskScoreGauge riskScore={currentRiskScore} transactionCount={totalTxns} />
+        )}
+
+        {/* Fraud Monitor Tab */}
+        {activeTab === 'fraud' && (
+          <>
+            {/* Middle Row: Transaction Volume Chart */}
+            <div className="mb-6">
+              <TransactionVolumeChart activityData={activityData} />
+            </div>
+
+            {/* System Status Bar */}
+            <div className="mb-6">
+              <SystemStatusBar info={systemInfo} wsConnected={wsConnected} />
+            </div>
+
+            {/* Bottom Row: 3-column layout */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="lg:col-span-1 h-[500px]">
+                <LiveTransactionFeed transactions={transactions} />
+              </div>
+              <div className="lg:col-span-1">
+                <RiskScoreGauge riskScore={currentRiskScore} transactionCount={totalTxns} />
+              </div>
+              <div className="lg:col-span-1">
+                <FraudHeatmap activityData={activityData} />
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* Sector Overview Tab */}
+        {activeTab === 'sector' && (
+          <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+            <div className="xl:col-span-2 space-y-6">
+              <SectorSummary />
+              <InstitutionList
+                mode="all"
+                onSelect={(code) => { setSelectedInstitutionCode(code); }}
+              />
+            </div>
+            <div className="xl:col-span-1">
+              <div className="sticky top-6">
+                <InstitutionDashboard institutionCode={selectedInstitutionCode} />
+              </div>
+            </div>
           </div>
-          <div className="lg:col-span-1">
-            <FraudHeatmap activityData={activityData} />
-          </div>
-        </div>
+        )}
 
         {/* Footer */}
         <footer className="mt-8 pb-6 border-t border-slate-800 pt-4">
           <div className="flex items-center justify-between text-[10px] text-slate-600 font-mono">
-            <span>BOU Sentinel v1.0.0 • Real-Time Fraud Detection System</span>
+            <span>BOU Sentinel v1.0.0 • Real-Time Fraud Detection & Regulatory Oversight</span>
             <span>Built for Bank of Uganda Hackathon</span>
             <span>{new Date().getFullYear()}</span>
           </div>
