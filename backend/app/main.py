@@ -1,3 +1,16 @@
+"""
+BOU Sentinel - Main Application
+Real-time fraud detection + regulatory compliance monitoring for Bank of Uganda.
+
+Changes from base version:
+  - ConnectionManager moved to app.ws_manager (singleton)
+  - Regulatory compliance router registered at /api/regulatory
+  - Institutions seeded on startup from seed_institutions.py
+  - create_transaction() now links transactions to supervised institutions
+    and re-scores their compliance risk in real-time via the compliance engine
+  - Compliance alerts are broadcast over the same /ws WebSocket channel;
+    frontends filter by message type: "transaction" | "compliance_alert"
+"""
 import asyncio
 import json
 import logging
@@ -5,12 +18,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import List, Optional
 
-try:
-    import redis.asyncio as aioredis
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
-
+import redis.asyncio as aioredis
 from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, case
@@ -18,117 +26,130 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import init_db, get_db
-from app.models import Transaction
-from app.schemas import HealthCheck, TransactionCreate, TransactionResponse
-from app.fraud_model import get_model
 
-# Configure logging
+# ── Fraud detection ──────────────────────────────────────────────────────────
+from app.models.models import Transaction
+from app.schemas import HealthCheck, TransactionCreate, TransactionResponse
+from app.models.fraud_model import get_model
+
+# ── Regulatory compliance ────────────────────────────────────────────────────
+from app.regulatory_models import Institution   # noqa: F401 (needed for create_all)
+from app.regulatory_models import ComplianceReport  # noqa: F401
+from app.compliance_engine import calculate_compliance_risk
+from app.seed_institutions import seed_institutions, get_institution_from_account
+from app.regulatory_router import router as regulatory_router
+
+# ── WebSocket ────────────────────────────────────────────────────────────────
+from app.ws_manager import manager  # singleton ConnectionManager
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bou-sentinel")
 
-# Redis is optional — WebSocket broadcasts work directly without it
-redis_client = None
+redis_client: Optional[aioredis.Redis] = None
+_redis_listener_task: Optional[asyncio.Task] = None
 
 
-# ============================================================
-# WebSocket Connection Manager
-# ============================================================
-class ConnectionManager:
+# ─────────────────────────────────────────────────────────────────────────────
+# REDIS PUB/SUB LISTENER
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def redis_pubsub_listener():
     """
-    Manages WebSocket connections and broadcasts messages to all clients.
-    This is the core real-time streaming mechanism — works without Redis.
+    Background task — subscribes to the Redis fraud_stream channel
+    and broadcasts received messages to all connected WebSocket clients.
     """
+    global redis_client
+    logger.info("📡 Starting Redis Pub/Sub listener...")
 
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-        self._lock = asyncio.Lock()
+    while True:
+        try:
+            if redis_client is None:
+                await asyncio.sleep(5)
+                continue
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        async with self._lock:
-            self.active_connections.append(websocket)
-        logger.info(f"🔌 WebSocket client connected. Total: {len(self.active_connections)}")
+            pubsub = redis_client.pubsub()
+            await pubsub.subscribe(settings.REDIS_CHANNEL)
+            logger.info(f"✅ Subscribed to Redis channel: {settings.REDIS_CHANNEL}")
 
-    async def disconnect(self, websocket: WebSocket):
-        async with self._lock:
-            if websocket in self.active_connections:
-                self.active_connections.remove(websocket)
-        logger.info(f"🔌 WebSocket client disconnected. Total: {len(self.active_connections)}")
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    data = message["data"]
+                    if isinstance(data, bytes):
+                        data = data.decode("utf-8")
+                    await manager.broadcast(data)
 
-    async def broadcast(self, message: str):
-        """Send a message to all connected WebSocket clients."""
-        async with self._lock:
-            disconnected = []
-            for connection in self.active_connections:
-                try:
-                    await connection.send_text(message)
-                except WebSocketDisconnect:
-                    disconnected.append(connection)
-                except Exception as e:
-                    logger.warning(f"⚠️ WebSocket send error: {e}")
-                    disconnected.append(connection)
-
-            for conn in disconnected:
-                if conn in self.active_connections:
-                    self.active_connections.remove(conn)
-
-    @property
-    def count(self) -> int:
-        return len(self.active_connections)
+        except asyncio.CancelledError:
+            logger.info("🛑 Redis Pub/Sub listener cancelled.")
+            break
+        except Exception as e:
+            logger.error(f"❌ Redis Pub/Sub error: {e}")
+            await asyncio.sleep(5)
 
 
-manager = ConnectionManager()
+# ─────────────────────────────────────────────────────────────────────────────
+# APPLICATION LIFESPAN
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-# ============================================================
-# Application Lifespan
-# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: startup and shutdown events."""
-    global redis_client
+    global redis_client, _redis_listener_task
 
-    # Startup
     logger.info("🚀 BOU Sentinel starting up...")
 
-    # Initialize database tables
+    # 1. Initialise database tables (Transaction + Institution + ComplianceReport)
     try:
         init_db()
-        logger.info("✅ Database tables initialized")
+        logger.info("✅ Database tables initialised")
     except Exception as e:
-        logger.warning(f"⚠️ Database initialization skipped: {e}")
+        logger.warning(f"⚠️  Database init skipped: {e}")
 
-    # Connect to Redis (optional — only if URL and package are available)
-    if REDIS_AVAILABLE:
-        try:
-            redis_client = aioredis.from_url(
-                settings.REDIS_URL,
-                decode_responses=True
-            )
-            await redis_client.ping()
-            logger.info("✅ Redis connection established")
-        except Exception as e:
-            logger.info(f"ℹ️ Redis not available — WebSocket broadcasts work without it. ({e})")
-            redis_client = None
-    else:
-        logger.info("ℹ️ Redis not installed — WebSocket broadcasts work without it.")
+    # 2. Seed BOU-supervised institutions
+    try:
+        db = next(get_db())
+        count = seed_institutions(db)
+        if count:
+            logger.info(f"✅ Seeded {count} BOU-supervised institutions")
+        else:
+            logger.info("ℹ️  Institution seed: all records already present")
+        db.close()
+    except Exception as e:
+        logger.warning(f"⚠️  Institution seed failed: {e}")
+
+    # 3. Connect to Redis
+    try:
+        redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+        await redis_client.ping()
+        logger.info("✅ Redis connection established")
+        _redis_listener_task = asyncio.create_task(redis_pubsub_listener())
+        logger.info("✅ Redis Pub/Sub listener started")
+    except Exception as e:
+        logger.warning(f"⚠️  Redis unavailable: {e}")
+        redis_client = None
 
     yield
 
     # Shutdown
     logger.info("🛑 BOU Sentinel shutting down...")
+    if _redis_listener_task:
+        _redis_listener_task.cancel()
+        try:
+            await _redis_listener_task
+        except asyncio.CancelledError:
+            pass
     if redis_client:
         await redis_client.close()
 
 
-# Create FastAPI app
+# ─────────────────────────────────────────────────────────────────────────────
+# APP FACTORY
+# ─────────────────────────────────────────────────────────────────────────────
+
 app = FastAPI(
     title=settings.APP_NAME,
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
-# CORS - allow frontend origin
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -137,15 +158,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Register the regulatory compliance router
+app.include_router(regulatory_router)
 
-# ============================================================
-# WebSocket Endpoint
-# ============================================================
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEBSOCKET  (single channel — both transaction events AND compliance alerts)
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    WebSocket endpoint for real-time transaction streaming.
-    Clients connect here to receive live fraud-scored transaction data.
+    Real-time stream.  Clients receive two event types:
+      {"type": "transaction",      ...fraud-scored transaction data...}
+      {"type": "compliance_alert", ...institution risk change...}
+    Filter on the client by `data.type`.
     """
     await manager.connect(websocket)
     try:
@@ -166,32 +193,33 @@ async def websocket_endpoint(websocket: WebSocket):
         await manager.disconnect(websocket)
 
 
-# ============================================================
-# REST Endpoints
-# ============================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# ROOT / HEALTH / STATUS
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.get("/", tags=["Root"])
 async def root():
-    """Root endpoint - redirect to docs."""
     return {
-        "message": "BOU Sentinel - Real-Time Fraud Detection Engine",
+        "message": "BOU Sentinel — Real-Time Fraud Detection & Regulatory Compliance Engine",
         "docs": "/docs",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "features": ["fraud_detection", "regulatory_compliance", "real_time_ws"],
     }
 
 
 @app.get("/health", response_model=HealthCheck, tags=["Health"])
 async def health_check():
-    """Comprehensive health check endpoint."""
     db_status = "disconnected"
     try:
         db = next(get_db())
-        db.execute(db.bind.dialect.statement_compiler(db.bind.dialect, db.bind).__class__.__module__)
+        db.execute(db.bind.dialect.statement_compiler(
+            db.bind.dialect, db.bind).__class__.__module__)
         db.close()
         db_status = "connected"
     except Exception:
         db_status = "disconnected"
 
-    redis_status = "not_configured"
+    redis_status = "disconnected"
     if redis_client:
         try:
             await redis_client.ping()
@@ -200,10 +228,9 @@ async def health_check():
             redis_status = "disconnected"
 
     model = get_model()
-
     return HealthCheck(
         status="healthy",
-        version="1.0.0",
+        version="2.0.0",
         database=db_status,
         redis=redis_status,
         model_loaded=model.is_loaded,
@@ -212,17 +239,48 @@ async def health_check():
 
 @app.get("/api/status", tags=["Status"])
 async def api_status():
-    """Simple status endpoint for the mock generator."""
     model = get_model()
     return {
         "status": "running",
         "service": "BOU Sentinel",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "redis_connected": redis_client is not None,
         "model_loaded": model.is_loaded,
         "model_version": "isolation_forest_v1",
         "ws_clients": manager.count,
+        "features": ["fraud_detection", "regulatory_compliance"],
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSACTION ENDPOINTS  (original + institution linkage)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _update_institution_fraud_stats(
+    institution_code: str,
+    is_fraud: bool,
+    db: Session,
+) -> Optional[Institution]:
+    """
+    Atomically increment an institution's transaction counters
+    and recompute its fraud_rate.  Returns the updated Institution or None.
+    """
+    inst = db.query(Institution).filter_by(institution_code=institution_code).first()
+    if not inst:
+        return None
+
+    inst.total_transactions = (inst.total_transactions or 0) + 1
+    if is_fraud:
+        inst.fraud_transactions = (inst.fraud_transactions or 0) + 1
+
+    total = inst.total_transactions
+    inst.fraud_rate = round(
+        (inst.fraud_transactions / total * 100) if total > 0 else 0.0, 4
+    )
+    db.add(inst)
+    db.commit()
+    db.refresh(inst)
+    return inst
 
 
 @app.post("/api/transactions", response_model=TransactionResponse, tags=["Transactions"])
@@ -233,20 +291,22 @@ async def create_transaction(
 ):
     """
     Receive a transaction, score it with the AI fraud model,
-    save it to PostgreSQL, and broadcast to WebSocket clients.
+    persist to PostgreSQL, publish to Redis Pub/Sub, and —
+    NEW — link the transaction to the sender's supervised institution,
+    updating that institution's fraud stats and re-scoring its
+    regulatory compliance risk in real-time.
     """
     model = get_model()
     tx_dict = transaction_data.model_dump()
 
-    # Score with AI model
+    # ── Fraud scoring ────────────────────────────────────────────────────────
     risk_score, is_fraud, fraud_reason = model.score(tx_dict)
-
     logger.info(
         f"📊 Transaction {transaction_data.transaction_id}: "
         f"risk={risk_score:.2f}, fraud={is_fraud}, reason={fraud_reason}"
     )
 
-    # Parse timestamp if provided
+    # ── Parse timestamp ──────────────────────────────────────────────────────
     timestamp = None
     if transaction_data.timestamp:
         try:
@@ -256,7 +316,7 @@ async def create_transaction(
         except (ValueError, AttributeError):
             timestamp = datetime.now(timezone.utc)
 
-    # Create database record
+    # ── Persist transaction ──────────────────────────────────────────────────
     db_transaction = Transaction(
         transaction_id=transaction_data.transaction_id,
         timestamp=timestamp or datetime.now(timezone.utc),
@@ -273,12 +333,11 @@ async def create_transaction(
         model_version="isolation_forest_v1",
         processed_at=datetime.now(timezone.utc),
     )
-
     db.add(db_transaction)
     db.commit()
     db.refresh(db_transaction)
 
-    # Build response
+    # ── Build API response ───────────────────────────────────────────────────
     response = TransactionResponse(
         id=db_transaction.id,
         transaction_id=db_transaction.transaction_id,
@@ -297,17 +356,66 @@ async def create_transaction(
         processed_at=db_transaction.processed_at.isoformat() if db_transaction.processed_at else None,
     )
 
-    response_json = response.model_dump_json()
-
-    # Broadcast to all WebSocket clients directly (no Redis needed!)
-    await manager.broadcast(response_json)
-
-    # Also publish to Redis if available (for scaling to multiple instances)
+    # ── Publish transaction event to Redis → WebSocket ────────────────────────
+    tx_event = {**response.model_dump(), "type": "transaction"}
     if redis_client:
         try:
-            await redis_client.publish(settings.REDIS_CHANNEL, response_json)
+            await redis_client.publish(settings.REDIS_CHANNEL, json.dumps(tx_event))
         except Exception as e:
-            logger.debug(f"Redis publish skipped: {e}")
+            logger.error(f"Failed to publish transaction to Redis: {e}")
+
+    # ── [NEW] Link transaction to institution & re-score compliance ────────────
+    institution_code = get_institution_from_account(transaction_data.sender_account)
+    if institution_code:
+        try:
+            inst = _update_institution_fraud_stats(institution_code, is_fraud, db)
+            if inst:
+                previous_level = inst.risk_level
+
+                # Re-run compliance engine with updated fraud stats
+                new_score, new_level, new_issues = calculate_compliance_risk(
+                    inst.to_dict(),
+                    fraud_stats={
+                        "fraud_rate": inst.fraud_rate,
+                        "total_transactions": inst.total_transactions,
+                        "fraud_transactions": inst.fraud_transactions,
+                    },
+                )
+
+                inst.risk_score = new_score
+                inst.risk_level = new_level
+                inst.set_issues(new_issues)
+                inst.last_risk_updated = datetime.now(timezone.utc)
+                db.add(inst)
+                db.commit()
+
+                # Broadcast compliance alert if fraud detected OR risk level changed
+                if is_fraud or previous_level != new_level:
+                    alert = {
+                        "type": "compliance_alert",
+                        "institution_code": inst.institution_code,
+                        "institution_name": inst.name,
+                        "tier": inst.tier,
+                        "risk_score": new_score,
+                        "risk_level": new_level,
+                        "previous_risk_level": previous_level,
+                        "trigger": "fraud_detected" if is_fraud else "risk_level_change",
+                        "fraud_rate": inst.fraud_rate,
+                        "fraud_transactions": inst.fraud_transactions,
+                        "total_transactions": inst.total_transactions,
+                        "issues": new_issues[:5],
+                        "transaction_id": transaction_data.transaction_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    await manager.broadcast(json.dumps(alert))
+                    logger.info(
+                        f"🏦 Compliance alert: {inst.institution_code} "
+                        f"fraud_rate={inst.fraud_rate:.1f}% | "
+                        f"risk: {previous_level} → {new_level}"
+                    )
+        except Exception as e:
+            logger.error(f"❌ Institution compliance update failed: {e}")
+            # Non-fatal — transaction was already saved successfully
 
     return response
 
@@ -349,21 +457,24 @@ async def get_fraud_transactions(
 
 @app.get("/api/stats", tags=["Statistics"])
 async def get_stats(db: Session = Depends(get_db)):
-    """Get aggregate statistics for the dashboard."""
+    """Aggregate statistics for the fraud detection dashboard."""
     total = db.query(Transaction).count()
     fraud_count = db.query(Transaction).filter(Transaction.is_fraud == True).count()
-    avg_risk = db.query(Transaction).with_entities(
-        db.query(Transaction.risk_score).subquery().c.risk_score
-    ).all()
+
+    avg_risk_rows = db.query(Transaction.risk_score).all()
+    avg_risk = (
+        round(sum(r[0] for r in avg_risk_rows if r[0]) / len(avg_risk_rows), 4)
+        if avg_risk_rows else 0
+    )
 
     recent_txs = (
         db.query(
-            func.date_trunc('minute', Transaction.processed_at).label('minute'),
-            func.count().label('total'),
-            func.sum(case((Transaction.is_fraud == True, 1), else_=0)).label('fraud')
+            func.date_trunc("minute", Transaction.processed_at).label("minute"),
+            func.count().label("total"),
+            func.sum(case((Transaction.is_fraud == True, 1), else_=0)).label("fraud"),
         )
-        .group_by(func.date_trunc('minute', Transaction.processed_at))
-        .order_by(func.date_trunc('minute', Transaction.processed_at).desc())
+        .group_by(func.date_trunc("minute", Transaction.processed_at))
+        .order_by(func.date_trunc("minute", Transaction.processed_at).desc())
         .limit(30)
         .all()
     )
@@ -372,9 +483,7 @@ async def get_stats(db: Session = Depends(get_db)):
         "total_transactions": total,
         "fraud_transactions": fraud_count,
         "fraud_rate": round(fraud_count / total * 100, 2) if total > 0 else 0,
-        "avg_risk_score": round(
-            sum(r[0] for r in avg_risk if r[0]) / len(avg_risk), 4
-        ) if avg_risk else 0,
+        "avg_risk_score": avg_risk,
         "recent_activity": [
             {
                 "minute": row.minute.isoformat() if row.minute else None,
