@@ -40,5 +40,4 @@ class HealthCheck(BaseModel):
     status: str
     version: str
     database: str
-    redis: str
     model_loaded: bool

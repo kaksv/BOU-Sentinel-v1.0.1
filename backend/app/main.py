@@ -11,17 +11,16 @@ Changes from base version:
   - Compliance alerts are broadcast over the same /ws WebSocket channel;
     frontends filter by message type: "transaction" | "compliance_alert"
 """
-import asyncio
+
 import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Optional
 
-import redis.asyncio as aioredis
-from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, case
+from sqlalchemy import func, case, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -30,51 +29,20 @@ from app.database import init_db, get_db
 # ── Fraud detection ──────────────────────────────────────────────────────────
 from app.models.models import Transaction
 from app.schemas import HealthCheck, TransactionCreate, TransactionResponse
-from app.fraud_model import get_model
-from app.institution_router import router as institution_router
+from app.models.fraud_model import get_model
+
+# ── Regulatory compliance ────────────────────────────────────────────────────
+from app.regulatory_models import Institution   # noqa: F401 (needed for create_all)
+from app.regulatory_models import ComplianceReport  # noqa: F401
+from app.compliance_engine import calculate_compliance_risk
+from app.seed_institutions import seed_institutions, get_institution_from_account
+from app.regulatory_router import router as regulatory_router
+
+# ── WebSocket ────────────────────────────────────────────────────────────────
+from app.ws_manager import manager  # singleton ConnectionManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bou-sentinel")
-
-redis_client: Optional[aioredis.Redis] = None
-_redis_listener_task: Optional[asyncio.Task] = None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# REDIS PUB/SUB LISTENER
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def redis_pubsub_listener():
-    """
-    Background task — subscribes to the Redis fraud_stream channel
-    and broadcasts received messages to all connected WebSocket clients.
-    """
-    global redis_client
-    logger.info("📡 Starting Redis Pub/Sub listener...")
-
-    while True:
-        try:
-            if redis_client is None:
-                await asyncio.sleep(5)
-                continue
-
-            pubsub = redis_client.pubsub()
-            await pubsub.subscribe(settings.REDIS_CHANNEL)
-            logger.info(f"✅ Subscribed to Redis channel: {settings.REDIS_CHANNEL}")
-
-            async for message in pubsub.listen():
-                if message["type"] == "message":
-                    data = message["data"]
-                    if isinstance(data, bytes):
-                        data = data.decode("utf-8")
-                    await manager.broadcast(data)
-
-        except asyncio.CancelledError:
-            logger.info("🛑 Redis Pub/Sub listener cancelled.")
-            break
-        except Exception as e:
-            logger.error(f"❌ Redis Pub/Sub error: {e}")
-            await asyncio.sleep(5)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,7 +51,6 @@ async def redis_pubsub_listener():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, _redis_listener_task
 
     logger.info("🚀 BOU Sentinel starting up...")
 
@@ -106,29 +73,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️  Institution seed failed: {e}")
 
-    # 3. Connect to Redis
-    try:
-        redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-        await redis_client.ping()
-        logger.info("✅ Redis connection established")
-        _redis_listener_task = asyncio.create_task(redis_pubsub_listener())
-        logger.info("✅ Redis Pub/Sub listener started")
-    except Exception as e:
-        logger.warning(f"⚠️  Redis unavailable: {e}")
-        redis_client = None
-
     yield
 
     # Shutdown
     logger.info("🛑 BOU Sentinel shutting down...")
-    if _redis_listener_task:
-        _redis_listener_task.cancel()
-        try:
-            await _redis_listener_task
-        except asyncio.CancelledError:
-            pass
-    if redis_client:
-        await redis_client.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -149,9 +97,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include institutional monitoring routes
-app.include_router(institution_router)
+# Register the regulatory compliance router
+app.include_router(regulatory_router)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEBSOCKET  (single channel — both transaction events AND compliance alerts)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -199,27 +151,17 @@ async def health_check():
     db_status = "disconnected"
     try:
         db = next(get_db())
-        db.execute(db.bind.dialect.statement_compiler(
-            db.bind.dialect, db.bind).__class__.__module__)
+        db.execute(text("SELECT 1"))
         db.close()
         db_status = "connected"
     except Exception:
         db_status = "disconnected"
-
-    redis_status = "disconnected"
-    if redis_client:
-        try:
-            await redis_client.ping()
-            redis_status = "connected"
-        except Exception:
-            redis_status = "disconnected"
 
     model = get_model()
     return HealthCheck(
         status="healthy",
         version="2.0.0",
         database=db_status,
-        redis=redis_status,
         model_loaded=model.is_loaded,
     )
 
@@ -231,7 +173,6 @@ async def api_status():
         "status": "running",
         "service": "BOU Sentinel",
         "version": "2.0.0",
-        "redis_connected": redis_client is not None,
         "model_loaded": model.is_loaded,
         "model_version": "isolation_forest_v1",
         "ws_clients": manager.count,
@@ -278,7 +219,7 @@ async def create_transaction(
 ):
     """
     Receive a transaction, score it with the AI fraud model,
-    persist to PostgreSQL, publish to Redis Pub/Sub, and —
+    persist to PostgreSQL, and —
     NEW — link the transaction to the sender's supervised institution,
     updating that institution's fraud stats and re-scoring its
     regulatory compliance risk in real-time.
@@ -342,14 +283,6 @@ async def create_transaction(
         model_version=db_transaction.model_version,
         processed_at=db_transaction.processed_at.isoformat() if db_transaction.processed_at else None,
     )
-
-    # ── Publish transaction event to Redis → WebSocket ────────────────────────
-    tx_event = {**response.model_dump(), "type": "transaction"}
-    if redis_client:
-        try:
-            await redis_client.publish(settings.REDIS_CHANNEL, json.dumps(tx_event))
-        except Exception as e:
-            logger.error(f"Failed to publish transaction to Redis: {e}")
 
     # ── [NEW] Link transaction to institution & re-score compliance ────────────
     institution_code = get_institution_from_account(transaction_data.sender_account)
