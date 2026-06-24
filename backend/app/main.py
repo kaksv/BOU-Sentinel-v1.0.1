@@ -11,16 +11,16 @@ Changes from base version:
   - Compliance alerts are broadcast over the same /ws WebSocket channel;
     frontends filter by message type: "transaction" | "compliance_alert"
 """
-import asyncio
+
 import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, case
+from sqlalchemy import func, case, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -29,17 +29,29 @@ from app.database import init_db, get_db
 # ── Fraud detection ──────────────────────────────────────────────────────────
 from app.models.models import Transaction
 from app.schemas import HealthCheck, TransactionCreate, TransactionResponse
-from app.fraud_model import get_model
-from app.institution_router import router as institution_router
+from app.models.fraud_model import get_model
+
+# ── Regulatory compliance ────────────────────────────────────────────────────
+from app.regulatory_models import Institution   # noqa: F401 (needed for create_all)
+from app.regulatory_models import ComplianceReport  # noqa: F401
+from app.compliance_engine import calculate_compliance_risk
+from app.seed_institutions import seed_institutions, get_institution_from_account
+from app.regulatory_router import router as regulatory_router
+
+# ── WebSocket ────────────────────────────────────────────────────────────────
+from app.ws_manager import manager  # singleton ConnectionManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bou-sentinel")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # APPLICATION LIFESPAN
 # ─────────────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
     logger.info("🚀 BOU Sentinel starting up...")
 
     # 1. Initialise database tables (Transaction + Institution + ComplianceReport)
@@ -61,12 +73,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️  Institution seed failed: {e}")
 
-    # 3. Connect to Redis
-    try:
-        # (Redis removed)
-        logger.info("ℹ️ Redis disabled in this build")
-    except Exception as e:
-        logger.warning(f"⚠️  Redis unavailable: {e}")
     yield
 
     # Shutdown
@@ -91,9 +97,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include institutional monitoring routes
-app.include_router(institution_router)
+# Register the regulatory compliance router
+app.include_router(regulatory_router)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEBSOCKET  (single channel — both transaction events AND compliance alerts)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -141,21 +151,17 @@ async def health_check():
     db_status = "disconnected"
     try:
         db = next(get_db())
-        db.execute(db.bind.dialect.statement_compiler(
-            db.bind.dialect, db.bind).__class__.__module__)
+        db.execute(text("SELECT 1"))
         db.close()
         db_status = "connected"
     except Exception:
         db_status = "disconnected"
-
-    redis_status = "disconnected"
 
     model = get_model()
     return HealthCheck(
         status="healthy",
         version="2.0.0",
         database=db_status,
-        redis=redis_status,
         model_loaded=model.is_loaded,
     )
 
@@ -167,7 +173,6 @@ async def api_status():
         "status": "running",
         "service": "BOU Sentinel",
         "version": "2.0.0",
-        "redis_connected": "disabled",
         "model_loaded": model.is_loaded,
         "model_version": "isolation_forest_v1",
         "ws_clients": manager.count,
@@ -260,7 +265,7 @@ async def create_transaction(
     db.commit()
     db.refresh(db_transaction)
 
-# ── Build API response ───────────────────────────────────────────────────
+    # ── Build API response ───────────────────────────────────────────────────
     response = TransactionResponse(
         id=db_transaction.id,
         transaction_id=db_transaction.transaction_id,
@@ -277,13 +282,7 @@ async def create_transaction(
         fraud_reason=db_transaction.fraud_reason,
         model_version=db_transaction.model_version,
         processed_at=db_transaction.processed_at.isoformat() if db_transaction.processed_at else None,
-      )
-
-# (Redis publishing removed — system now uses direct WebSocket broadcast via manager)
-
-    # ── Publish transaction event to Redis → WebSocket ────────────────────────
-    tx_event = {**response.model_dump(), "type": "transaction"}
-    # (Redis publishing removed — using direct WebSocket broadcast via manager)
+    )
 
     # ── [NEW] Link transaction to institution & re-score compliance ────────────
     institution_code = get_institution_from_account(transaction_data.sender_account)
