@@ -56,7 +56,7 @@ git push -u origin main
 | **Region** | Oregon |
 | **Branch** | `main` |
 | **Build Command** | `pip install -r requirements.txt` |
-| **Start Command** | `uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1` |
+| **Start Command** | `cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
 | **Plan** | **Free** |
 
 5. Click **"Advanced"** (bottom of the form)
