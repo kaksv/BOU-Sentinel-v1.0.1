@@ -1,25 +1,33 @@
 """
 BOU Sentinel - Backward-compatible institution API routes
-Maps /api/institutions/* -> /api/regulatory/* so frontends continue to work
-after the backend refactor that moved institution endpoints under /api/regulatory.
+Translates refactored schema to the field names the frontend expects.
 """
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from app.database import get_db
 
-router = APIRouter(prefix="/api/institutions", tags=["Institutions (legacy)"])
+router = APIRouter(prefix="/api/institutions", tags=["Institutions"])
 
 
-def _get_regulatory_summary(db: Session):
-    # Import lazily to avoid circular imports
-    from app.regulatory_models import Institution
-    from app.institution_service import get_sector_summary  # noqa: F401 (may not exist)
-    institutions = db.query(Institution).filter(Institution.is_active == True).all()
-    return get_sector_summary([i.to_dict() for i in institutions])
+def _translate(d):
+    """Translate a refactored Institution dict to frontend-compatible field names."""
+    d["institution_name"] = d.pop("name", "")
+    d["overall_risk_score"] = d.get("risk_score")
+    d["compliance_score"] = round(100 - (d.get("risk_score") or 0), 1)
+    score = d.get("risk_score") or 0
+    if score < 25:
+        d["compliance_status"] = "compliant"
+    elif score < 50:
+        d["compliance_status"] = "warning"
+    else:
+        d["compliance_status"] = "non_compliant"
+    return d
 
 
-@router.get("/", summary="List institutions (legacy alias)")
+@router.get("/", summary="List all institutions")
 async def list_institutions(
     tier: str | None = Query(None),
     status: str | None = Query(None),
@@ -29,99 +37,88 @@ async def list_institutions(
     limit: int = 100,
     db: Session = Depends(get_db),
 ):
-    # Delegate to the regulatory router's logic via redirect
-    from fastapi.responses import RedirectResponse
-    params = []
-    if tier: params.append(f"tier={tier}")
-    if status: params.append(f"status={status}")
-    if region: params.append(f"region={region}")
-    if search: params.append(f"search={search}")
-    params.append(f"skip={skip}")
-    params.append(f"limit={limit}")
-    qs = "&".join(params)
-    return RedirectResponse(url=f"/api/regulatory/institutions?{qs}", status_code=307)
-
-
-@router.get("/summary", summary="Sector summary (legacy alias)")
-async def institution_summary(db: Session = Depends(get_db)):
     from app.regulatory_models import Institution
-    from app.compliance_engine import calculate_compliance_risk, BOU_THRESHOLDS
-    institutions = db.query(Institution).filter(Institution.is_active == True).all()
-    inst_dicts = [i.to_dict() for i in institutions]
-    # Build summary manually since get_sector_summary isn't exported
-    total = len(inst_dicts)
-    compliant = sum(1 for i in inst_dicts if i.get("compliance_status") == "compliant")
-    warning = sum(1 for i in inst_dicts if i.get("compliance_status") == "warning")
-    under_review = sum(1 for i in inst_dicts if i.get("compliance_status") == "under_review")
-    non_compliant = sum(1 for i in inst_dicts if i.get("compliance_status") == "non_compliant")
-    suspended = sum(1 for i in inst_dicts if i.get("compliance_status") == "suspended")
-    avg_risk = sum(i.get("overall_risk_score", 0) for i in inst_dicts) / total if total else 0
-    avg_compliance = sum(i.get("compliance_score", 0) for i in inst_dicts) / total if total else 0
+    query = db.query(Institution)
+    if tier:
+        query = query.filter(Institution.tier == tier)
+    if search:
+        query = query.filter(
+            (Institution.institution_code.ilike(f"%{search}%"))
+            | (Institution.name.ilike(f"%{search}%"))
+        )
+    total = query.count()
+    return {"total": total, "institutions": [_translate(i.to_dict()) for i in query.offset(skip).limit(limit).all()]}
+
+
+@router.get("/summary", summary="Sector-wide compliance summary")
+async def get_sector_summary(db: Session = Depends(get_db)):
+    from app.regulatory_models import Institution
+    dicts = [_translate(i.to_dict()) for i in db.query(Institution).all()]
+    total = len(dicts)
+    if total == 0:
+        return {"total_institutions": 0, "compliant_count": 0, "warning_count": 0, "under_review_count": 0,
+                "non_compliant_count": 0, "suspended_count": 0, "compliance_rate_pct": 0,
+                "non_compliance_rate_pct": 0, "average_risk_score": 0, "average_compliance_score": 0}
+    c = {"compliant": 0, "warning": 0, "under_review": 0, "non_compliant": 0}
+    for d in dicts:
+        s = d.get("compliance_status", "compliant")
+        if s in c: c[s] += 1
+    avg_risk = round(sum(d.get("overall_risk_score") or 0 for d in dicts) / total, 1)
+    avg_c = round(sum(d.get("compliance_score") or 0 for d in dicts) / total, 1)
     return {
         "total_institutions": total,
-        "compliant_count": compliant,
-        "warning_count": warning,
-        "under_review_count": under_review,
-        "non_compliant_count": non_compliant,
-        "suspended_count": suspended,
-        "compliance_rate_pct": round(compliant / total * 100, 1) if total else 0,
-        "non_compliance_rate_pct": round((non_compliant + suspended) / total * 100, 1) if total else 0,
-        "average_risk_score": round(avg_risk, 1),
-        "average_compliance_score": round(avg_compliance, 1),
+        "compliant_count": c["compliant"],
+        "warning_count": c["warning"],
+        "under_review_count": c["under_review"],
+        "non_compliant_count": c["non_compliant"],
+        "suspended_count": 0,
+        "compliance_rate_pct": round(c["compliant"] / total * 100, 1),
+        "non_compliance_rate_pct": round((c["non_compliant"]) / total * 100, 1),
+        "average_risk_score": avg_risk,
+        "average_compliance_score": avg_c,
     }
 
 
-@router.get("/tiers", summary="Tier breakdown (legacy alias)")
-async def tier_breakdown(db: Session = Depends(get_db)):
+@router.get("/tiers", summary="Breakdown by regulatory tier")
+async def get_tier_breakdown(db: Session = Depends(get_db)):
     from app.regulatory_models import Institution
-    from app.compliance_engine import BOU_THRESHOLDS
     results = []
-    for tier_key, tier_meta in BOU_THRESHOLDS.items():
-        institutions = db.query(Institution).filter(
-            Institution.tier == tier_key,
-            Institution.is_active == True,
-        ).all()
-        if not institutions:
-            continue
-        total = len(institutions)
-        compliant = sum(1 for i in institutions if i.compliance_status == "compliant")
-        at_risk = sum(1 for i in institutions if i.compliance_status in ("non_compliant", "warning"))
-        avg_risk = sum(i.overall_risk_score for i in institutions) / total
+    for tier_key, in db.query(Institution.tier).distinct():
+        rows = db.query(Institution).filter(Institution.tier == tier_key).all()
+        count = len(rows)
+        compliant = sum(1 for r in rows if (r.risk_score or 0) < 25)
+        nc = sum(1 for r in rows if (r.risk_score or 0) >= 75)
+        w = sum(1 for r in rows if 50 <= (r.risk_score or 0) < 75)
         results.append({
             "tier": tier_key,
-            "tier_name": tier_meta["name"],
-            "total_institutions": total,
+            "tier_name": tier_key,
+            "total_institutions": count,
             "compliant_count": compliant,
-            "at_risk_count": at_risk,
-            "compliance_rate_pct": round(compliant / total * 100, 1),
-            "average_risk_score": round(avg_risk, 1),
+            "at_risk_count": nc + w,
+            "compliance_rate_pct": round(compliant / count * 100, 1) if count else 0,
+            "average_risk_score": round(sum((r.risk_score or 0) for r in rows) / count, 1) if count else 0,
+            "average_compliance_score": round(sum(100 - (r.risk_score or 0) for r in rows) / count, 1) if count else 0,
         })
     return {"tiers": results}
 
 
-@router.get("/at-risk", summary="At-risk institutions (legacy alias)")
-async def at_risk(limit: int = 50, db: Session = Depends(get_db)):
+@router.get("/at-risk", summary="Institutions with compliance issues")
+async def get_at_risk(limit: int = 50, db: Session = Depends(get_db)):
     from app.regulatory_models import Institution
-    institutions = (
-        db.query(Institution)
-        .filter(
-            Institution.compliance_status.in_(["non_compliant", "warning", "under_review"]),
-            Institution.is_active == True,
-        )
-        .order_by(Institution.overall_risk_score.desc())
-        .limit(limit)
-        .all()
-    )
-    return {"count": len(institutions), "institutions": [i.to_dict() for i in institutions]}
+    institutions = db.query(Institution).filter(Institution.risk_score >= 50).order_by(Institution.risk_score.desc()).limit(limit).all()
+    return {"count": len(institutions), "institutions": [_translate(i.to_dict()) for i in institutions]}
 
 
-@router.get("/{institution_code}", summary="Institution details (legacy alias)")
-async def institution_detail(institution_code: str):
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url=f"/api/regulatory/institutions/{institution_code}", status_code=307)
+@router.get("/{institution_code}", summary="Get institution details")
+async def get_institution(institution_code: str, db: Session = Depends(get_db)):
+    from app.regulatory_models import Institution
+    inst = db.query(Institution).filter_by(institution_code=institution_code).first()
+    if not inst:
+        raise HTTPException(status_code=404, detail="Institution not found")
+    return _translate(inst.to_dict())
 
 
-@router.post("/seed", summary="Seed database (legacy alias)")
+@router.post("/seed", summary="Seed database with BOU institutions")
 async def seed(db: Session = Depends(get_db)):
     from app.seed_institutions import seed_institutions
     try:
@@ -131,20 +128,27 @@ async def seed(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.put("/{institution_code}/refresh", summary="Refresh metrics (legacy alias)")
+@router.put("/{institution_code}/refresh", summary="Refresh compliance metrics")
 async def refresh(institution_code: str, db: Session = Depends(get_db)):
     from app.regulatory_models import Institution
-    from app.compliance_engine import generate_compliance_metrics
-    import random
-    institution = db.query(Institution).filter_by(institution_code=institution_code).first()
-    if not institution:
+    from app.seed_institutions import SEED_INSTITUTIONS
+    from app.compliance_engine import calculate_compliance_risk
+    inst = db.query(Institution).filter_by(institution_code=institution_code).first()
+    if not inst:
         raise HTTPException(status_code=404, detail="Institution not found")
     seed_data = next((i for i in SEED_INSTITUTIONS if i["institution_code"] == institution_code), None)
     if seed_data:
-        metrics = generate_compliance_metrics(seed_data, seed_offset=random.randint(0, 999))
-        for key, value in metrics.items():
-            setattr(institution, key, value)
-        institution.updated_at = datetime.now(timezone.utc)
+        risk_score, risk_level, issues = calculate_compliance_risk(
+            seed_data, fraud_stats={
+                "fraud_rate": inst.fraud_rate / 100 if inst.fraud_rate else 0,
+                "total_transactions": inst.total_transactions or 0,
+                "fraud_transactions": inst.fraud_transactions or 0,
+            },
+        )
+        inst.risk_score = risk_score
+        inst.risk_level = risk_level
+        inst.set_issues(issues)
+        inst.updated_at = datetime.now(timezone.utc)
         db.commit()
-        db.refresh(institution)
-    return institution.to_dict()
+        db.refresh(inst)
+    return _translate(inst.to_dict())
