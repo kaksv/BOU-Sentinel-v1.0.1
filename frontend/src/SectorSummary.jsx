@@ -12,7 +12,7 @@ import {
   Tooltip,
   Legend,
 } from 'recharts';
-import { fetchSectorSummary, fetchTierBreakdown } from './institutionApi';
+import { fetchSectorSummary, fetchTierBreakdown, seedInstitutions } from './institutionApi';
 
 const COLORS = {
   compliant: '#10b981',
@@ -27,6 +27,8 @@ export default function SectorSummary() {
   const [tiers, setTiers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [seeding, setSeeding] = useState(false);
+  const [seedMsg, setSeedMsg] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,6 +68,23 @@ export default function SectorSummary() {
     );
   }
 
+  const handleSeed = async () => {
+    try {
+      setSeeding(true);
+      setSeedMsg(null);
+      const res = await seedInstitutions();
+      setSeedMsg(res.message || `Seeded ${res.total} institutions`);
+      // Reload summary after seeding
+      const [s, t] = await Promise.all([fetchSectorSummary(), fetchTierBreakdown()]);
+      setSummary(s);
+      setTiers(t.tiers || []);
+    } catch (e) {
+      setSeedMsg(e.message);
+    } finally {
+      setSeeding(false);
+    }
+  };
+
   if (!summary) return null;
 
   const pieData = [
@@ -94,6 +113,21 @@ export default function SectorSummary() {
 
   return (
     <div className="space-y-6">
+      {/* Seed Button */}
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-slate-200">Sector Summary</h3>
+        <button
+          onClick={handleSeed}
+          disabled={seeding}
+          className="px-3 py-1.5 rounded-lg bg-bou-600 hover:bg-bou-500 disabled:opacity-50 text-white text-[10px] font-semibold transition-colors"
+        >
+          {seeding ? 'Seeding...' : 'Seed Database'}
+        </button>
+      </div>
+      {seedMsg && (
+        <div className={`text-[11px] font-mono ${seedMsg.includes('Failed') ? 'text-fraud-400' : 'text-emerald-400'}`}>{seedMsg}</div>
+      )}
+
       {/* KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="card">
