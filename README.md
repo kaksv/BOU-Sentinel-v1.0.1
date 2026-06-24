@@ -19,7 +19,16 @@ A dual-layered financial platform that combines an AI-powered fraud detection en
 - **Live Transaction Feed** with color-coded risk indicators
 - **AI Risk Score Gauge** with animated needle
 - **Fraud Activity Heatmap** showing concentration of risk
-- **System Status Bar** showing backend health (WebSocket, Redis, Model)
+- **System Status Bar** showing backend health (WebSocket, Model)
+
+### Institutional Compliance Monitoring
+- **Sector Summary** with KPI cards: total institutions, compliance rate, non-compliance rate, avg risk score
+- **Compliance Breakdown Pie Chart**: compliant / warning / under_review / non_compliant / suspended
+- **Tier Breakdown Bar Chart**: compliance % by regulatory tier (Tier I–IV, Forex Bureaus, Money Remitters, etc.)
+- **Institution Registry**: searchable, filterable table of all BOU-regulated entities
+- **At-Risk Institutions view**: prioritized list of non-compliant / warning / under-review entities
+- **Institution Detail Panel**: full compliance profile with risk flags, regulatory thresholds, AML/CFT scores, and compliance checklist
+- **Real-time Metrics Refresh**: simulate live BOU data pulls with one click
 
 ---
 
@@ -77,6 +86,12 @@ mock_generator.py ──POST──▶ /api/transactions ──▶ FastAPI
                                                       ├──▶ PostgreSQL (save)
                                                       │
                                                       └──▶ WebSocket.broadcast() ──▶ React Dashboard
+
+/institutions/* ──REST──▶ Institution Router ──▶ PostgreSQL
+                                                      │
+                                                      ├──▶ Sector Summary aggregations
+                                                      ├──▶ Tier breakdown analytics
+                                                      └──▶ Compliance metrics per entity
 ```
 
 ---
@@ -221,6 +236,13 @@ BOU-Sentinel/
 | `GET` | `/api/transactions` | Paginated transaction history |
 | `GET` | `/api/transactions/fraud` | Fraud-only transactions |
 | `GET` | `/api/stats` | Aggregate stats + recent activity data |
+| `GET` | `/api/institutions/` | List all regulated institutions (filterable) |
+| `GET` | `/api/institutions/summary` | Sector-wide compliance summary (KPI cards) |
+| `GET` | `/api/institutions/at-risk` | Institutions flagged non-compliant / warning / under-review |
+| `GET` | `/api/institutions/tiers` | Compliance breakdown by regulatory tier |
+| `GET` | `/api/institutions/{code}` | Full compliance profile for one institution |
+| `POST` | `/api/institutions/seed` | Seed database with BOU-regulated institutions |
+| `PUT` | `/api/institutions/{code}/refresh` | Refresh compliance metrics (simulate live data pull) |
 
 ### WebSocket
 

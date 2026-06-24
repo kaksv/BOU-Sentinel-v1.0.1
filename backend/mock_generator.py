@@ -351,13 +351,34 @@ Examples:
         action="store_true",
         help="Generate and POST a single transaction, then exit",
     )
+    parser.add_argument(
+        "--seed",
+        action="store_true",
+        help="Seed the institution database with BOU-regulated institutions",
+    )
 
     args = parser.parse_args()
 
     # Ensure API URL has no trailing slash
     api_url = args.api.rstrip("/")
 
-    if args.single:
+    if args.seed:
+        # Seed institution database
+        print(f"\nSeeding institution database...")
+        try:
+            res = requests.post(f"{api_url}/api/institutions/seed", timeout=30)
+            if res.status_code == 200:
+                data = res.json()
+                print(f"✅ {data.get('message', 'Done')}")
+                print(json.dumps(data, indent=2))
+            else:
+                print(f"❌ Seed failed: {res.status_code} {res.text}")
+                sys.exit(1)
+        except Exception as e:
+            print(f"❌ Seed error: {e}")
+            sys.exit(1)
+
+    elif args.single:
         # Single transaction mode
         tx = generate_transaction()
         print(f"\nGenerating single transaction...")

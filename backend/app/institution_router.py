@@ -192,45 +192,51 @@ async def seed_institutions(db: Session = Depends(get_db)):
     from app.institution_models import RegulatedInstitution
     from app.institution_service import SEED_INSTITUTIONS, generate_compliance_metrics
 
-    created = 0
-    updated = 0
+    try:
+        created = 0
+        updated = 0
 
-    for idx, inst_data in enumerate(SEED_INSTITUTIONS):
-        existing = (
-            db.query(RegulatedInstitution)
-            .filter(RegulatedInstitution.institution_code == inst_data["institution_code"])
-            .first()
-        )
-
-        metrics = generate_compliance_metrics(inst_data, seed_offset=idx * 7)
-
-        if existing:
-            # Update compliance metrics (simulate real-time refresh)
-            for key, value in metrics.items():
-                setattr(existing, key, value)
-            existing.updated_at = datetime.now(timezone.utc)
-            updated += 1
-        else:
-            institution = RegulatedInstitution(
-                institution_code=inst_data["institution_code"],
-                institution_name=inst_data["institution_name"],
-                tier=inst_data["tier"],
-                license_number=inst_data.get("license_number"),
-                registered_address=inst_data.get("registered_address"),
-                region=inst_data.get("region"),
-                primary_regulator="Bank of Uganda",
-                **metrics,
+        for idx, inst_data in enumerate(SEED_INSTITUTIONS):
+            existing = (
+                db.query(RegulatedInstitution)
+                .filter(RegulatedInstitution.institution_code == inst_data["institution_code"])
+                .first()
             )
-            db.add(institution)
-            created += 1
 
-    db.commit()
-    logger.info(f"Institution seed: {created} created, {updated} updated")
+            metrics = generate_compliance_metrics(inst_data, seed_offset=idx * 7)
 
-    return {
-        "message": f"Seeded {created} new institutions, updated {updated} existing",
-        "total": created + updated,
-    }
+            if existing:
+                for key, value in metrics.items():
+                    setattr(existing, key, value)
+                existing.updated_at = datetime.now(timezone.utc)
+                updated += 1
+            else:
+                institution = RegulatedInstitution(
+                    institution_code=inst_data["institution_code"],
+                    institution_name=inst_data["institution_name"],
+                    tier=inst_data["tier"],
+                    license_number=inst_data.get("license_number"),
+                    registered_address=inst_data.get("registered_address"),
+                    region=inst_data.get("region"),
+                    primary_regulator="Bank of Uganda",
+                    **metrics,
+                )
+                db.add(institution)
+                created += 1
+
+        db.commit()
+        logger.info(f"Institution seed: {created} created, {updated} updated")
+
+        return {
+            "message": f"Seeded {created} new institutions, updated {updated} existing",
+            "total": created + updated,
+        }
+    except Exception as e:
+        import traceback
+        db.rollback()
+        error_detail = traceback.format_exc()
+        logger.error(f"Seed failed: {error_detail}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.put("/{institution_code}/refresh", summary="Refresh compliance metrics")
