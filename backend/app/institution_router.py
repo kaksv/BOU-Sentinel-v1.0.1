@@ -45,15 +45,36 @@ async def list_institutions(
 @router.get("/summary", summary="Sector summary (legacy alias)")
 async def institution_summary(db: Session = Depends(get_db)):
     from app.regulatory_models import Institution
-    from app.institution_service import get_sector_summary
+    from app.compliance_engine import calculate_compliance_risk, BOU_THRESHOLDS
     institutions = db.query(Institution).filter(Institution.is_active == True).all()
-    return get_sector_summary([i.to_dict() for i in institutions])
+    inst_dicts = [i.to_dict() for i in institutions]
+    # Build summary manually since get_sector_summary isn't exported
+    total = len(inst_dicts)
+    compliant = sum(1 for i in inst_dicts if i.get("compliance_status") == "compliant")
+    warning = sum(1 for i in inst_dicts if i.get("compliance_status") == "warning")
+    under_review = sum(1 for i in inst_dicts if i.get("compliance_status") == "under_review")
+    non_compliant = sum(1 for i in inst_dicts if i.get("compliance_status") == "non_compliant")
+    suspended = sum(1 for i in inst_dicts if i.get("compliance_status") == "suspended")
+    avg_risk = sum(i.get("overall_risk_score", 0) for i in inst_dicts) / total if total else 0
+    avg_compliance = sum(i.get("compliance_score", 0) for i in inst_dicts) / total if total else 0
+    return {
+        "total_institutions": total,
+        "compliant_count": compliant,
+        "warning_count": warning,
+        "under_review_count": under_review,
+        "non_compliant_count": non_compliant,
+        "suspended_count": suspended,
+        "compliance_rate_pct": round(compliant / total * 100, 1) if total else 0,
+        "non_compliance_rate_pct": round((non_compliant + suspended) / total * 100, 1) if total else 0,
+        "average_risk_score": round(avg_risk, 1),
+        "average_compliance_score": round(avg_compliance, 1),
+    }
 
 
 @router.get("/tiers", summary="Tier breakdown (legacy alias)")
 async def tier_breakdown(db: Session = Depends(get_db)):
     from app.regulatory_models import Institution
-    from app.institution_service import BOU_THRESHOLDS
+    from app.compliance_engine import BOU_THRESHOLDS
     results = []
     for tier_key, tier_meta in BOU_THRESHOLDS.items():
         institutions = db.query(Institution).filter(
@@ -113,7 +134,7 @@ async def seed(db: Session = Depends(get_db)):
 @router.put("/{institution_code}/refresh", summary="Refresh metrics (legacy alias)")
 async def refresh(institution_code: str, db: Session = Depends(get_db)):
     from app.regulatory_models import Institution
-    from app.seed_institutions import SEED_INSTITUTIONS, generate_compliance_metrics
+    from app.compliance_engine import generate_compliance_metrics
     import random
     institution = db.query(Institution).filter_by(institution_code=institution_code).first()
     if not institution:
