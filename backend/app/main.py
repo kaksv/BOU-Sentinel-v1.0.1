@@ -97,8 +97,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register the regulatory compliance router
+# Register routers
 app.include_router(regulatory_router)
+from app.institution_router import router as institution_router
+app.include_router(institution_router)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
