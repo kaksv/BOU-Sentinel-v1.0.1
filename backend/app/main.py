@@ -21,6 +21,7 @@ from app.database import init_db, get_db
 from app.models import Transaction
 from app.schemas import HealthCheck, TransactionCreate, TransactionResponse
 from app.fraud_model import get_model
+from app.institution_router import router as institution_router
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -136,6 +137,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include institutional monitoring routes
+app.include_router(institution_router)
 
 
 # ============================================================
