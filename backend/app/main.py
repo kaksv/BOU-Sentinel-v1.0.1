@@ -99,8 +99,11 @@ app.add_middleware(
 
 # Register routers
 app.include_router(regulatory_router)
-from app.institution_router import router as institution_router
-app.include_router(institution_router)
+try:
+    from app.institution_router import router as institution_router
+    app.include_router(institution_router)
+except Exception as e:
+    logger.warning(f"Institution router not loaded: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
