@@ -30,6 +30,7 @@ from app.database import init_db, get_db
 from app.models.models import Transaction
 from app.schemas import HealthCheck, TransactionCreate, TransactionResponse
 from app.models.fraud_model import get_model
+from app.seed_transactions import seed_transactions
 
 # ── Regulatory compliance ────────────────────────────────────────────────────
 from app.regulatory_models import Institution   # noqa: F401 (needed for create_all)
@@ -72,6 +73,21 @@ async def lifespan(app: FastAPI):
         db.close()
     except Exception as e:
         logger.warning(f"⚠️  Institution seed failed: {e}")
+
+    # 3. Seed historical transactions
+    try:
+        db = next(get_db())
+        result = seed_transactions(db, n=500)
+        if result["inserted"] > 0:
+            logger.info(
+                f"✅ Seeded {result['inserted']} transactions "
+                f"({result['fraud_flagged']} flagged, {result['fraud_rate_pct']}% fraud rate)"
+            )
+        else:
+            logger.info("ℹ️  Transaction seed: all records already present")
+        db.close()
+    except Exception as e:
+        logger.warning(f"⚠️  Transaction seed failed: {e}")
 
     yield
 
@@ -419,3 +435,28 @@ async def get_stats(db: Session = Depends(get_db)):
         ],
         "ws_connected_clients": manager.count,
     }
+
+@app.post("/api/transactions/seed", tags=["Transactions"])
+async def seed_transactions_endpoint(
+    n: int = 500,
+    db: Session = Depends(get_db),
+):
+    """
+    Seed `n` synthetic historical transactions for all BOU-supervised institutions.
+    Scores each through the live Isolation Forest model.
+    Idempotent — skips transaction_ids that already exist.
+
+    Usage:
+      curl -X POST "http://localhost:8000/api/transactions/seed?n=500"
+    """
+    try:
+        result = seed_transactions(db, n=n)
+        return {
+            "status": "ok",
+            "requested": n,
+            **result,
+        }
+    except Exception as e:
+        logger.error(f"❌ Transaction seed failed: {e}")
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
