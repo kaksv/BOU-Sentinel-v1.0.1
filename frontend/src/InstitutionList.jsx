@@ -50,6 +50,7 @@ export default function InstitutionList({ onSelect }) {
         });
 
         if (!alive) return;
+        console.log('RAW ITEMS:', res);
 
         const items = res.institutions || [];
 
@@ -167,9 +168,10 @@ export default function InstitutionList({ onSelect }) {
             <tr>
               <th className="p-2 text-left">Code</th>
               <th className="p-2 text-left">Name</th>
-              <th className="p-2">Tier</th>
+              <th className="p-2">Institution Type</th>
               <th className="p-2">Status</th>
               <th className="p-2 text-right">Risk</th>
+              <th className="p-2 text-right">Head Quarter</th>
             </tr>
           </thead>
 
@@ -184,12 +186,16 @@ export default function InstitutionList({ onSelect }) {
                   {inst.institution_code}
                 </td>
                 <td className="p-2 text-slate-200">
-                  {inst.name}
+                  {inst.institution_name
+}
                 </td>
-                <td className="p-2">{inst.tier}</td>
+                <td className="p-2">{inst.institution_type}</td>
                 <td className="p-2">{inst.license_status}</td>
                 <td className="p-2 text-right">
                   {inst.risk_score}
+                </td>
+                <td className="p-2 text-right">
+                  {inst.headquarters}
                 </td>
               </tr>
             ))}
