@@ -19,6 +19,7 @@ import FraudAlertBanner from './FraudAlertBanner';
 import SectorSummary from './SectorSummary';
 import InstitutionList from './InstitutionList';
 import InstitutionDashboard from './InstitutionDashboard';
+import Modal from './Modal';
 
 // In development, Vite proxy handles /api and /ws
 // In production, set VITE_API_URL to your Render backend (e.g., https://bou-sentinel.onrender.com)
@@ -408,20 +409,26 @@ export default function App() {
 
         {/* Sector Overview Tab */}
         {activeTab === 'sector' && (
-          <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-            <div className="xl:col-span-2 space-y-6">
+          <>
+            <div className="space-y-6">
               <SectorSummary />
+
               <InstitutionList
                 mode="all"
-                onSelect={(code) => { setSelectedInstitutionCode(code); }}
+                onSelect={setSelectedInstitutionCode}
               />
             </div>
-            <div className="xl:col-span-1">
-              <div className="sticky top-6">
-                <InstitutionDashboard institutionCode={selectedInstitutionCode} />
-              </div>
-            </div>
-          </div>
+
+            <Modal
+              open={!!selectedInstitutionCode}
+              onClose={() => setSelectedInstitutionCode(null)}
+            >
+              <InstitutionDashboard
+                institutionCode={selectedInstitutionCode}
+                onClose={() => setSelectedInstitutionCode(null)}
+              />
+            </Modal>
+          </>
         )}
 
         {/* Footer */}
