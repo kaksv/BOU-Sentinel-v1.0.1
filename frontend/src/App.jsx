@@ -434,12 +434,12 @@ export default function App() {
         )}
 
         {/* Footer */}
-        <footer className="mt-8 pb-6 border-t border-slate-800 pt-4">
-          <div className="flex items-center justify-between text-[10px] text-slate-600 font-mono">
+        <footer className="mt-8 pb-6 border-t border-slate-800 pt-4 text-slate-600 font-mono mx -10">
+          <div className="flex flex-row items-center sm:justify-between gap-4 text-[10px]   sm:flex-row">
             <span>BOU Sentinel v1.0.0 • Real-Time Fraud Detection & Regulatory Oversight</span>
             <span>Built for Bank of Uganda Hackathon</span>
-            <span>{new Date().getFullYear()}</span>
           </div>
+          <div className='mt-12 flex items-center justify-center  text-[10px] text-center mb-0 pb-0'> <span>&copy;{new Date().getFullYear()}. All rights reserved.</span></div>
         </footer>
       </main>
     </div>
