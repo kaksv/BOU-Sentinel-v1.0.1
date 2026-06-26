@@ -38,6 +38,7 @@ from app.regulatory_models import ComplianceReport  # noqa: F401
 from app.compliance_engine import calculate_compliance_risk
 from app.seed_institutions import seed_institutions, get_institution_from_account
 from app.regulatory_router import router as regulatory_router
+from app.simulate_router import router as simulate_router
 
 # ── WebSocket ────────────────────────────────────────────────────────────────
 from app.ws_manager import manager  # singleton ConnectionManager
@@ -286,6 +287,25 @@ async def create_transaction(
     db.commit()
     db.refresh(db_transaction)
 
+    # ── [ADD THIS] Broadcast transaction over WebSocket immediately ──────────
+    await manager.broadcast(json.dumps({
+        "type":             "transaction",
+        "id":               db_transaction.id,
+        "transaction_id":   db_transaction.transaction_id,
+        "sender_account":   db_transaction.sender_account,
+        "receiver_account": db_transaction.receiver_account,
+        "amount":           db_transaction.amount,
+        "transaction_type": db_transaction.transaction_type,
+        "location":         db_transaction.location,
+        "device_id":        db_transaction.device_id,
+        "ip_address":       db_transaction.ip_address,
+        "risk_score":       db_transaction.risk_score,
+        "is_fraud":         db_transaction.is_fraud,
+        "fraud_reason":     db_transaction.fraud_reason,
+        "timestamp":        db_transaction.timestamp.isoformat(),
+        "processed_at":     db_transaction.processed_at.isoformat(),
+    }))
+
     # ── Build API response ───────────────────────────────────────────────────
     response = TransactionResponse(
         id=db_transaction.id,
@@ -460,3 +480,5 @@ async def seed_transactions_endpoint(
         logger.error(f"❌ Transaction seed failed: {e}")
         from fastapi import HTTPException
         raise HTTPException(status_code=500, detail=str(e))
+    
+app.include_router(simulate_router)
