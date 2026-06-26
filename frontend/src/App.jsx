@@ -20,6 +20,7 @@ import SectorSummary from './SectorSummary';
 import InstitutionList from './InstitutionList';
 import InstitutionDashboard from './InstitutionDashboard';
 import Modal from './Modal';
+import SimulationControl from './SimulationControl';
 
 // In development, Vite proxy handles /api and /ws
 // In production, set VITE_API_URL to your Render backend (e.g., https://bou-sentinel.onrender.com)
@@ -376,9 +377,10 @@ export default function App() {
                 </svg>
               }
             />
+            <SimulationControl />
           </div>
-        )}
 
+        )}
         {/* Fraud Monitor Tab */}
         {activeTab === 'fraud' && (
           <>
@@ -477,6 +479,11 @@ function SystemStatusBar({ info, wsConnected }) {
             <div className="px-2 py-0.5 rounded bg-slate-700/50 border border-slate-600/50">
               <span className="text-[9px] font-mono text-slate-500">
                 Isolation Forest v1
+              </span>
+            </div>
+            <div className="px-2 py-0.5 rounded bg-slate-700/50 border border-slate-600/50">
+              <span className="text-[9px] font-mono text-slate-500">
+                <SimulationControl />
               </span>
             </div>
           </div>
